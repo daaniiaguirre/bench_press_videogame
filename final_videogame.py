@@ -18,35 +18,49 @@ BAUD_RATE   = 115200
 # --- Encoder angle range (degrees) ---
 # Set to the actual min/max angles your encoder reads during the full
 # range of motion of the bench-press machine.
-MIN_ANGLE   = 100.0          # angle (°) at the bottom  (bar fully lowered)
-MAX_ANGLE   = 200.0          # angle (°) at the top     (bar fully pressed up)
+MIN_ANGLE   = 301.0          # angle (°) at the bottom  (bar fully lowered)
+MAX_ANGLE   = 280.0           # angle (°) at the top     (bar fully pressed up)
+
+# --- Invert Direction ---
+# False: Ball goes UP when angle INCREASES.
+# True:  Ball goes UP when angle DECREASES.
+INVERT_DIRECTION = True
 
 # --- Path Speeds and Angles ---
 # GAME_SPEED: How fast the world automatically scrolls (pixels per second).
 # Higher values mean you have to execute the reps faster!
-GAME_SPEED     = 250.0       
+GAME_SPEED     = 200.0       
 
 # UPHILL_ANGLE / DOWNHILL_ANGLE: The steepness of the path in degrees (10° to 80°).
 # 80° = very steep (requires fast pressing)
 # 10° = low slope  (requires slow, controlled pressing)
-UPHILL_ANGLE   = 45.0        # Pressing phase slope
-DOWNHILL_ANGLE = 45.0        # Lowering phase slope
+UPHILL_ANGLE   = 60.0        # Pressing phase slope
+DOWNHILL_ANGLE = 35.0        # Lowering phase slope
 
 # --- Coins ---
 COINS_PER_REP = 5            # how many coins are placed along each rep cycle
-COIN_RADIUS   = 22           # how close the ball must be to collect a coin
+COIN_RADIUS   = 25           # how close the ball must be to collect a coin
+
+# --- Stroke Calculation ---
+STROKE_START_ANGLE = 301.55  # retracted
+STROKE_END_ANGLE   = 263.23  # extended
+L_RETRACTED_MM     = 809.607
+L_EXTENDED_MM      = 476.640
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+import os
 import sys
 import math
 import time
+import csv
 import threading
 import collections
 import re
 import pygame
 import serial
 import serial.tools.list_ports
+from datetime import datetime
 
 # ── constants ──────────────────────────────────────────────────────────────
 SCREEN_W, SCREEN_H = 1280, 720
@@ -117,13 +131,82 @@ class EncoderReader(threading.Thread):
             self._error = str(e)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ANGLE → SCREEN Y
+# ANGLE → SCREEN Y  (AND Y → ANGLE FOR LOGGING)
 # ─────────────────────────────────────────────────────────────────────────────
 def angle_to_y(angle):
     """Map encoder angle to a vertical pixel position on screen."""
-    t = (angle - MIN_ANGLE) / max(MAX_ANGLE - MIN_ANGLE, 0.001)
+    low_val = min(MIN_ANGLE, MAX_ANGLE)
+    high_val = max(MIN_ANGLE, MAX_ANGLE)
+    
+    span = high_val - low_val
+    if span < 0.001:
+        span = 0.001
+        
+    t = (angle - low_val) / span
+    
+    if INVERT_DIRECTION:
+        t = 1.0 - t
+        
     t = max(0.0, min(1.0, t))
     return int(PATH_Y_BOT - t * (PATH_Y_BOT - PATH_Y_TOP))
+
+def y_to_angle(y):
+    """Map vertical screen pixel position back to encoder angle for the CSV."""
+    low_val = min(MIN_ANGLE, MAX_ANGLE)
+    high_val = max(MIN_ANGLE, MAX_ANGLE)
+    span = high_val - low_val
+    if span < 0.001:
+        span = 0.001
+        
+    dy = PATH_Y_BOT - PATH_Y_TOP
+    if dy == 0:
+        return low_val
+        
+    t = (PATH_Y_BOT - y) / dy
+    
+    if INVERT_DIRECTION:
+        t = 1.0 - t
+        
+    return t * span + low_val
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STROKE CALCULATION
+# ─────────────────────────────────────────────────────────────────────────────
+def calculate_stroke(angle):
+    """Convert the current angle to a stroke length in mm."""
+    angle_span = STROKE_START_ANGLE - STROKE_END_ANGLE
+    if angle_span == 0:
+        return 0.0
+        
+    full_stroke_mm = abs(L_RETRACTED_MM - L_EXTENDED_MM)
+    stroke_fraction = (STROKE_START_ANGLE - angle) / angle_span
+    
+    # Clip between 0.0 and 1.0 (Replaces numpy.clip)
+    stroke_fraction = max(0.0, min(1.0, stroke_fraction))
+    
+    return stroke_fraction * full_stroke_mm
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSV SAVING FUNCTION
+# ─────────────────────────────────────────────────────────────────────────────
+def save_recording(data_log, coins_collected, total_coins):
+    """Save the recorded angles and coins to a CSV file."""
+    os.makedirs("recordings", exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"recordings/bench_press_log_{timestamp}.csv"
+    
+    with open(filename, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["# BENCH PRESS GAME RESULTS"])
+        writer.writerow([f"# Coins Collected: {coins_collected}"])
+        writer.writerow([f"# Total Coins: {total_coins}"])
+        pct = int(100 * coins_collected / max(total_coins, 1))
+        writer.writerow([f"# Percentage: {pct}%"])
+        writer.writerow([])
+        # Added Stroke (mm) column here
+        writer.writerow(["Time (s)", "Target Angle (deg)", "Actual Angle (deg)", "Stroke (mm)"])
+        writer.writerows(data_log)
+    print(f"Game data safely stored to {filename}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PATH GENERATOR
@@ -140,44 +223,6 @@ class PathSegment:
         t = (x - self.x0) / (self.x1 - self.x0)
         return self.y0 + t * (self.y1 - self.y0)
 
-# def build_path(num_reps, coins_per_rep):
-#     """
-#     Build the full triangle-wave path and coin positions for num_reps.
-#     Calculates distance horizontally based on strictly enforced slope angles.
-#     """
-#     segments = []
-#     coins    = []
-#     x = 0
-#     y_bot = PATH_Y_BOT
-#     y_top = PATH_Y_TOP
-#     dy = y_bot - y_top
-
-#     # Ensure angle bounds (10 to 80 degrees) to prevent math errors (tan(0) / tan(90))
-#     up_ang = max(10.0, min(80.0, UPHILL_ANGLE))
-#     dn_ang = max(10.0, min(80.0, DOWNHILL_ANGLE))
-
-#     # Trigonometry: delta_X = delta_Y / tan(angle)
-#     up_width   = dy / math.tan(math.radians(up_ang))
-#     down_width = dy / math.tan(math.radians(dn_ang))
-
-#     for rep in range(num_reps):
-#         # ── uphill (press) ──────────────────────────────────────────────
-#         seg_up = PathSegment(x, y_bot, x + up_width, y_top)
-#         segments.append(seg_up)
-#         # place coins evenly along uphill
-#         for k in range(1, coins_per_rep + 1):
-#             t  = k / (coins_per_rep + 1)
-#             cx = seg_up.x0 + t * (seg_up.x1 - seg_up.x0)
-#             cy = seg_up.y0 + t * (seg_up.y1 - seg_up.y0)
-#             coins.append([cx, cy, False])   # [x, y, collected]
-#         x += up_width
-
-#         # ── downhill (lower) ────────────────────────────────────────────
-#         seg_dn = PathSegment(x, y_top, x + down_width, y_bot)
-#         segments.append(seg_dn)
-#         x += down_width
-
-#     return segments, coins
 def build_path(num_reps, coins_per_rep):
     """
     Build the full triangle-wave path and coin positions for num_reps.
@@ -482,6 +527,10 @@ def game_loop(screen, fonts, encoder, total_reps):
     coins_collected  = 0
     tick             = 0
     current_seg_idx  = 0
+    
+    # Data logging variables
+    recording_data   = []
+    time_elapsed     = 0.0
 
     # collect spark particles
     sparks = []   # [(x, y, vx, vy, life, colour)]
@@ -489,11 +538,13 @@ def game_loop(screen, fonts, encoder, total_reps):
     while True:
         tick += 1
         dt = clock.tick(FPS) / 1000.0
+        time_elapsed += dt
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit(); sys.exit()
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                save_recording(recording_data, coins_collected, total_coins)
                 return coins_collected, total_coins
 
         # ── Advance world_x automatically by Game Speed ────────────────────
@@ -515,6 +566,7 @@ def game_loop(screen, fonts, encoder, total_reps):
         # Check for game end condition
         if world_x >= segments[-1].x1:
             reps_done = total_reps
+            save_recording(recording_data, coins_collected, total_coins)
             return coins_collected, total_coins
 
         # ── ball position (controlled entirely by user angle) ───────────────
@@ -522,6 +574,21 @@ def game_loop(screen, fonts, encoder, total_reps):
         ball_world_y = angle_to_y(angle)
         ball_sx      = BALL_SCREEN_X
         ball_sy      = ball_world_y
+
+        # ── data logging ────────────────────────────────────────────────
+        seg = segments[min(current_seg_idx, len(segments) - 1)]
+        target_y = int(seg.y_at(world_x))
+        target_angle = y_to_angle(target_y)
+        
+        # Stroke calculation using the new function
+        actual_stroke = calculate_stroke(angle)
+        
+        recording_data.append([
+            round(time_elapsed, 3), 
+            round(target_angle, 2), 
+            round(angle, 2),
+            round(actual_stroke, 2)
+        ])
 
         # ── coin collection ─────────────────────────────────────────────
         for coin in coins:
@@ -566,8 +633,6 @@ def game_loop(screen, fonts, encoder, total_reps):
         draw_ball(screen, ball_sx, ball_sy, tick)
 
         # path target guide line (vertical)
-        seg = segments[min(current_seg_idx, len(segments) - 1)]
-        target_y = int(seg.y_at(world_x))
         diff = abs(ball_sy - target_y)
         tol  = 40
         guide_col = GREEN if diff < tol else (ORANGE if diff < tol * 2 else BALL_COL)
